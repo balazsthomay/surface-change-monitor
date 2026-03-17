@@ -13,12 +13,17 @@ change maps match ground-truth annotations.  Supports:
   and the number of months elapsed since the change date.
 - Sweep over multiple probability thresholds to find the operating point that
   best balances precision and recall.
+- Reporting: visual comparison panels, markdown metrics tables, and latency
+  timeline figures for embedding in validation reports.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
+import matplotlib
+import matplotlib.figure
 import numpy as np
 import xarray as xr
 from shapely import Geometry as BaseGeometry
@@ -357,3 +362,327 @@ def metrics_at_thresholds(
         ``thresholds``.  Returns an empty list when ``thresholds`` is empty.
     """
     return [compute_pixel_metrics(prediction, ground_truth, threshold=t) for t in thresholds]
+
+
+# ---------------------------------------------------------------------------
+# Reporting functions
+# ---------------------------------------------------------------------------
+
+
+def generate_visual_comparison(
+    composite_t1: xr.DataArray,
+    composite_t2: xr.DataArray,
+    prediction: xr.DataArray,
+    ground_truth: xr.DataArray | None = None,
+    output_path: Path | None = None,
+) -> matplotlib.figure.Figure:
+    """Create a multi-panel visual comparison figure.
+
+    Renders a 1×4 panel (or 1×3 if no ground truth is provided):
+
+    * **T1 RGB** — before-composite using bands at indices 2, 1, 0 (B04, B03, B02).
+    * **T2 RGB** — after-composite using the same band ordering.
+    * **Prediction heatmap** — probability map in [0, 1] rendered with the
+      ``'hot'`` colormap.
+    * **GT overlay** — T2 RGB with the binary ground-truth mask overlaid in
+      semi-transparent red (omitted when ``ground_truth`` is ``None``).
+
+    Multi-band composites are expected to have a leading ``bands`` dimension of
+    at least 3 elements.  Single-band inputs are broadcast to a 3-channel
+    grayscale image so the function still produces a valid figure.
+
+    Parameters
+    ----------
+    composite_t1:
+        xr.DataArray of shape ``(bands, H, W)`` for the *before* period.
+    composite_t2:
+        xr.DataArray of shape ``(bands, H, W)`` for the *after* period.
+    prediction:
+        xr.DataArray of shape ``(H, W)`` containing predicted change
+        probabilities in [0, 1].
+    ground_truth:
+        Optional xr.DataArray of shape ``(H, W)`` containing binary (0/1)
+        ground-truth labels.  When supplied, a fourth panel is added showing
+        the GT mask overlaid on the T2 RGB image.
+    output_path:
+        When provided, the figure is saved to this path before being returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The constructed figure.  The caller is responsible for closing it.
+    """
+    import matplotlib.pyplot as plt
+
+    def _to_rgb(composite: xr.DataArray) -> np.ndarray:
+        """Extract bands 0-2 and normalise to [0, 1] float32."""
+        arr = _to_numpy(composite)
+        # If shape is (H, W) — single-band — expand to (1, H, W)
+        if arr.ndim == 2:
+            arr = arr[np.newaxis, :, :]
+        # Take first three bands; if fewer than 3, repeat the last band
+        if arr.shape[0] >= 3:
+            rgb = arr[:3].transpose(1, 2, 0).astype(np.float32)
+        elif arr.shape[0] == 2:
+            rgb = np.stack([arr[0], arr[1], arr[1]], axis=-1).astype(np.float32)
+        else:
+            rgb = np.stack([arr[0], arr[0], arr[0]], axis=-1).astype(np.float32)
+        # Normalise each channel to [0, 1]; guard against flat channels
+        for c in range(3):
+            lo, hi = rgb[..., c].min(), rgb[..., c].max()
+            if hi > lo:
+                rgb[..., c] = (rgb[..., c] - lo) / (hi - lo)
+            else:
+                rgb[..., c] = 0.0
+        return rgb
+
+    n_panels = 4 if ground_truth is not None else 3
+    fig, axes = plt.subplots(1, n_panels, figsize=(4 * n_panels, 4))
+
+    rgb_t1 = _to_rgb(composite_t1)
+    rgb_t2 = _to_rgb(composite_t2)
+    pred_np = _to_numpy(prediction).astype(np.float32)
+    if pred_np.ndim > 2:
+        pred_np = pred_np.squeeze()
+
+    axes[0].imshow(rgb_t1)
+    axes[0].set_title("T1 RGB (before)")
+    axes[0].axis("off")
+
+    axes[1].imshow(rgb_t2)
+    axes[1].set_title("T2 RGB (after)")
+    axes[1].axis("off")
+
+    im = axes[2].imshow(pred_np, cmap="hot", vmin=0.0, vmax=1.0)
+    axes[2].set_title("Prediction heatmap")
+    axes[2].axis("off")
+    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+    if ground_truth is not None:
+        gt_np = _to_numpy(ground_truth).astype(np.float32)
+        if gt_np.ndim > 2:
+            gt_np = gt_np.squeeze()
+        # Overlay GT mask in semi-transparent red on the T2 RGB image
+        axes[3].imshow(rgb_t2)
+        mask_rgba = np.zeros((*gt_np.shape, 4), dtype=np.float32)
+        mask_rgba[..., 0] = 1.0   # red channel
+        mask_rgba[..., 3] = gt_np * 0.5  # alpha from GT mask
+        axes[3].imshow(mask_rgba)
+        axes[3].set_title("GT overlay")
+        axes[3].axis("off")
+
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, bbox_inches="tight", dpi=150)
+
+    return fig
+
+
+def generate_metrics_table(
+    metrics: dict[str, ValidationMetrics],
+) -> str:
+    """Return a Markdown table comparing validation metrics across study areas.
+
+    The table contains one row per study area and columns for every metric
+    stored in :class:`ValidationMetrics`.  Floating-point values are formatted
+    to four decimal places; integer counts are formatted without decimals.
+
+    Parameters
+    ----------
+    metrics:
+        Mapping from study-area name to its :class:`ValidationMetrics` object.
+        An empty mapping produces a table with only the header row.
+
+    Returns
+    -------
+    str
+        A valid Markdown table string including a header separator row.
+    """
+    columns = [
+        ("Area", lambda m, name: name),
+        ("Threshold", lambda m, _: f"{m.threshold:.4f}"),
+        ("Pixel Precision", lambda m, _: f"{m.pixel_precision:.4f}"),
+        ("Pixel Recall", lambda m, _: f"{m.pixel_recall:.4f}"),
+        ("Pixel F1", lambda m, _: f"{m.pixel_f1:.4f}"),
+        ("Poly Precision", lambda m, _: f"{m.polygon_precision:.4f}"),
+        ("Poly Recall", lambda m, _: f"{m.polygon_recall:.4f}"),
+        ("Poly F1", lambda m, _: f"{m.polygon_f1:.4f}"),
+        ("N True Changes", lambda m, _: str(m.n_true_changes)),
+        ("N Predicted", lambda m, _: str(m.n_predicted_changes)),
+        ("Mean IoU", lambda m, _: f"{m.mean_iou:.4f}"),
+    ]
+
+    headers = [col[0] for col in columns]
+    header_row = "| " + " | ".join(headers) + " |"
+    separator_row = "| " + " | ".join("---" for _ in headers) + " |"
+
+    data_rows: list[str] = []
+    for area_name, m in metrics.items():
+        cells = [fmt(m, area_name) for _, fmt in columns]
+        data_rows.append("| " + " | ".join(cells) + " |")
+
+    lines = [header_row, separator_row] + data_rows
+    return "\n".join(lines)
+
+
+def generate_latency_figure(
+    latency_results: dict[str, dict],
+    output_path: Path | None = None,
+) -> matplotlib.figure.Figure:
+    """Create a timeline figure showing detection delay vs HRL update cycle.
+
+    Each study area is plotted as a horizontal timeline with three annotated
+    points:
+
+    * **Change date** — when the surface change is known to have occurred.
+    * **Detection date** — the first month the model exceeds the detection
+      threshold (shown only when ``detection_date`` is not ``None``).
+    * **HRL update** — a reference marker placed 18 months after the change
+      date, representing the typical Copernicus HRL update cycle (1–3 years).
+
+    The latency gap between the change date and the detection date is shown as
+    a horizontal span.  Areas where detection never occurred show only the
+    change marker and the HRL reference line.
+
+    Parameters
+    ----------
+    latency_results:
+        Mapping from study-area name to a dict containing:
+
+        * ``"change_date"`` (``str``): ``"YYYY-MM"`` month of the known change.
+        * ``"detection_date"`` (``str | None``): ``"YYYY-MM"`` month of first
+          detection, or ``None`` if never detected.
+        * ``"latency_months"`` (``int | None``): pre-computed latency in months.
+
+    output_path:
+        When provided, the figure is saved to this path before being returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The constructed figure.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    def _ym_to_float(ym: str) -> float:
+        """Convert 'YYYY-MM' to a float year suitable for axis placement."""
+        year, month = ym.split("-")
+        return int(year) + (int(month) - 1) / 12.0
+
+    n_areas = len(latency_results)
+    fig_height = max(3, n_areas * 1.5 + 1.5)
+    fig, ax = plt.subplots(figsize=(12, fig_height))
+
+    y_positions = list(range(n_areas))
+    area_names = list(latency_results.keys())
+
+    hrl_cycle_months = 18  # reference update frequency in months
+
+    for y_pos, area_name in zip(y_positions, area_names):
+        result = latency_results[area_name]
+        change_date: str = result["change_date"]
+        detection_date: str | None = result.get("detection_date")
+        latency_months: int | None = result.get("latency_months")
+
+        change_x = _ym_to_float(change_date)
+        hrl_x = change_x + hrl_cycle_months / 12.0
+
+        # Change date marker
+        ax.plot(change_x, y_pos, marker="o", color="steelblue", markersize=10, zorder=3)
+        ax.annotate(
+            f"Change\n{change_date}",
+            xy=(change_x, y_pos),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8,
+            color="steelblue",
+        )
+
+        # HRL reference marker
+        ax.axvline(hrl_x, color="gray", linestyle="--", alpha=0.5, linewidth=1)
+        ax.annotate(
+            f"HRL update\n(+{hrl_cycle_months} mo)",
+            xy=(hrl_x, y_pos),
+            xytext=(4, -15),
+            textcoords="offset points",
+            ha="left",
+            fontsize=7,
+            color="gray",
+        )
+
+        if detection_date is not None:
+            detection_x = _ym_to_float(detection_date)
+            # Latency span
+            ax.axhspan(
+                y_pos - 0.25,
+                y_pos + 0.25,
+                xmin=0,  # will be clipped; use fill_betweenx instead
+                alpha=0.0,  # reset — drawn below
+            )
+            ax.fill_betweenx(
+                [y_pos - 0.25, y_pos + 0.25],
+                change_x,
+                detection_x,
+                alpha=0.25,
+                color="orange",
+            )
+            ax.plot(
+                detection_x,
+                y_pos,
+                marker="^",
+                color="darkorange",
+                markersize=10,
+                zorder=3,
+            )
+            latency_label = (
+                f"Detected\n{detection_date}\n({latency_months} mo)"
+                if latency_months is not None
+                else f"Detected\n{detection_date}"
+            )
+            ax.annotate(
+                latency_label,
+                xy=(detection_x, y_pos),
+                xytext=(0, 10),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+                color="darkorange",
+            )
+        else:
+            ax.annotate(
+                "Not detected",
+                xy=(change_x + 0.1, y_pos),
+                xytext=(10, 0),
+                textcoords="offset points",
+                ha="left",
+                fontsize=8,
+                color="red",
+            )
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(area_names)
+    ax.set_xlabel("Time (year)")
+    ax.set_title("Detection Latency vs HRL Update Cycle")
+
+    # Legend
+    legend_handles = [
+        mpatches.Patch(color="steelblue", label="Change date"),
+        mpatches.Patch(color="darkorange", label="Detection date"),
+        mpatches.Patch(color="orange", alpha=0.4, label="Latency gap"),
+        mpatches.Patch(color="gray", alpha=0.5, label="HRL update (+18 mo)"),
+    ]
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=8)
+
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, bbox_inches="tight", dpi=150)
+
+    return fig

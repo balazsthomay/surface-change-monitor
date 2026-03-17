@@ -6,14 +6,22 @@ Tests cover:
   - test_polygon_level_metrics: TP = pred polygon with IoU > 0.3 against any GT polygon
   - test_detection_latency: Known change date + detection date -> latency
   - test_metrics_at_thresholds: Metrics at multiple probability thresholds
+  - test_generate_visual_comparison: Figure shape, type, and output path
+  - test_generate_metrics_table: Markdown structure and content
+  - test_generate_latency_figure: Figure type and timeline annotations
 """
 
 from __future__ import annotations
 
+import matplotlib
 import numpy as np
 import pytest
 import xarray as xr
 from shapely.geometry import box
+
+# Use a non-interactive backend for all tests so figures can be created without
+# a display server.
+matplotlib.use("Agg")
 
 
 # ---------------------------------------------------------------------------
@@ -599,3 +607,419 @@ class TestValidationMetricsDataclass:
         assert m.n_predicted_changes == 9
         assert m.mean_iou == pytest.approx(0.65)
         assert m.threshold == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by reporting tests
+# ---------------------------------------------------------------------------
+
+
+def _make_composite(bands: int = 3, h: int = 8, w: int = 8) -> xr.DataArray:
+    """Return a synthetic (bands, H, W) composite DataArray."""
+    data = np.random.default_rng(42).random((bands, h, w)).astype(np.float32)
+    return xr.DataArray(
+        data,
+        dims=["bands", "y", "x"],
+        coords={
+            "bands": np.arange(bands),
+            "y": np.linspace(0, 1, h),
+            "x": np.linspace(0, 1, w),
+        },
+    )
+
+
+def _make_pred_da(h: int = 8, w: int = 8) -> xr.DataArray:
+    """Return a synthetic (H, W) probability DataArray."""
+    data = np.random.default_rng(7).random((h, w)).astype(np.float32)
+    return xr.DataArray(data, dims=["y", "x"])
+
+
+def _make_gt_da(h: int = 8, w: int = 8) -> xr.DataArray:
+    """Return a synthetic (H, W) binary DataArray."""
+    rng = np.random.default_rng(13)
+    data = rng.integers(0, 2, size=(h, w), dtype=np.int32)
+    return xr.DataArray(data, dims=["y", "x"])
+
+
+def _make_metrics(
+    pixel_f1: float = 0.75,
+    polygon_f1: float = 0.70,
+    threshold: float = 0.5,
+) -> "ValidationMetrics":
+    from surface_change_monitor.validate import ValidationMetrics
+
+    return ValidationMetrics(
+        pixel_precision=0.8,
+        pixel_recall=pixel_f1,
+        pixel_f1=pixel_f1,
+        polygon_precision=0.7,
+        polygon_recall=polygon_f1,
+        polygon_f1=polygon_f1,
+        n_true_changes=10,
+        n_predicted_changes=9,
+        mean_iou=0.6,
+        threshold=threshold,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 14.2a  test_generate_visual_comparison
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateVisualComparison:
+    def test_returns_figure(self):
+        """Function returns a matplotlib Figure object."""
+        import matplotlib.figure
+
+        from surface_change_monitor.validate import generate_visual_comparison
+
+        fig = generate_visual_comparison(
+            composite_t1=_make_composite(),
+            composite_t2=_make_composite(),
+            prediction=_make_pred_da(),
+        )
+        try:
+            assert isinstance(fig, matplotlib.figure.Figure)
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_three_panels_without_ground_truth(self):
+        """Without GT, the figure has 3 content panels (+ 1 colorbar = 4 axes total)."""
+        from surface_change_monitor.validate import generate_visual_comparison
+
+        fig = generate_visual_comparison(
+            composite_t1=_make_composite(),
+            composite_t2=_make_composite(),
+            prediction=_make_pred_da(),
+            ground_truth=None,
+        )
+        try:
+            # 3 image panels + 1 colorbar axis
+            content_axes = [ax for ax in fig.axes if ax.get_label() != "<colorbar>"]
+            assert len(content_axes) == 3
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_four_panels_with_ground_truth(self):
+        """With GT, the figure has 4 content panels (+ 1 colorbar = 5 axes total)."""
+        from surface_change_monitor.validate import generate_visual_comparison
+
+        fig = generate_visual_comparison(
+            composite_t1=_make_composite(),
+            composite_t2=_make_composite(),
+            prediction=_make_pred_da(),
+            ground_truth=_make_gt_da(),
+        )
+        try:
+            # 4 image panels + 1 colorbar axis
+            content_axes = [ax for ax in fig.axes if ax.get_label() != "<colorbar>"]
+            assert len(content_axes) == 4
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_saves_to_output_path(self, tmp_path):
+        """Figure is saved to disk when output_path is provided."""
+        from surface_change_monitor.validate import generate_visual_comparison
+
+        out = tmp_path / "comparison.png"
+        fig = generate_visual_comparison(
+            composite_t1=_make_composite(),
+            composite_t2=_make_composite(),
+            prediction=_make_pred_da(),
+            output_path=out,
+        )
+        try:
+            assert out.exists()
+            assert out.stat().st_size > 0
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_single_band_composite(self):
+        """Single-band composites are accepted and produce 3 content panels."""
+        from surface_change_monitor.validate import generate_visual_comparison
+
+        fig = generate_visual_comparison(
+            composite_t1=_make_composite(bands=1),
+            composite_t2=_make_composite(bands=1),
+            prediction=_make_pred_da(),
+        )
+        try:
+            content_axes = [ax for ax in fig.axes if ax.get_label() != "<colorbar>"]
+            assert len(content_axes) == 3
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_two_band_composite(self):
+        """Two-band composites are accepted without errors."""
+        from surface_change_monitor.validate import generate_visual_comparison
+
+        fig = generate_visual_comparison(
+            composite_t1=_make_composite(bands=2),
+            composite_t2=_make_composite(bands=2),
+            prediction=_make_pred_da(),
+        )
+        try:
+            assert isinstance(fig.axes[0].get_images()[0], matplotlib.image.AxesImage)
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_creates_parent_directories(self, tmp_path):
+        """output_path parent directories are created automatically."""
+        from surface_change_monitor.validate import generate_visual_comparison
+
+        out = tmp_path / "subdir" / "nested" / "fig.png"
+        fig = generate_visual_comparison(
+            composite_t1=_make_composite(),
+            composite_t2=_make_composite(),
+            prediction=_make_pred_da(),
+            output_path=out,
+        )
+        try:
+            assert out.exists()
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# 14.2b  test_generate_metrics_table
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateMetricsTable:
+    def test_returns_string(self):
+        """Function returns a str."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        table = generate_metrics_table({"Bergen": _make_metrics()})
+        assert isinstance(table, str)
+
+    def test_header_present(self):
+        """Table contains the expected column headers."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        table = generate_metrics_table({"Bergen": _make_metrics()})
+        assert "Pixel F1" in table
+        assert "Poly F1" in table
+        assert "Mean IoU" in table
+        assert "Area" in table
+
+    def test_separator_row_present(self):
+        """Table has a Markdown separator row (--- pattern)."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        table = generate_metrics_table({"Bergen": _make_metrics()})
+        lines = table.splitlines()
+        assert any("---" in line for line in lines)
+
+    def test_area_names_in_table(self):
+        """Each area name appears in the table."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        areas = {"Bergen": _make_metrics(pixel_f1=0.8), "Houston": _make_metrics(pixel_f1=0.65)}
+        table = generate_metrics_table(areas)
+        assert "Bergen" in table
+        assert "Houston" in table
+
+    def test_empty_metrics_dict(self):
+        """Empty dict produces a table with header + separator but no data rows."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        table = generate_metrics_table({})
+        lines = table.splitlines()
+        # header row + separator row = 2 lines
+        assert len(lines) == 2
+
+    def test_multiple_areas_produce_multiple_rows(self):
+        """Three areas yield header + separator + 3 data rows = 5 lines total."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        areas = {
+            "Bergen": _make_metrics(),
+            "Houston": _make_metrics(),
+            "Oslo": _make_metrics(),
+        }
+        table = generate_metrics_table(areas)
+        lines = table.splitlines()
+        assert len(lines) == 5
+
+    def test_metric_values_formatted(self):
+        """Numeric values appear formatted to 4 decimal places."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        table = generate_metrics_table({"Bergen": _make_metrics(pixel_f1=0.75)})
+        assert "0.7500" in table
+
+    def test_pipe_delimited_format(self):
+        """Every non-empty line starts and ends with '|'."""
+        from surface_change_monitor.validate import generate_metrics_table
+
+        table = generate_metrics_table({"Bergen": _make_metrics()})
+        for line in table.splitlines():
+            if line.strip():
+                assert line.startswith("|")
+                assert line.endswith("|")
+
+
+# ---------------------------------------------------------------------------
+# 14.2c  test_generate_latency_figure
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateLatencyFigure:
+    def test_returns_figure(self):
+        """Function returns a matplotlib Figure."""
+        import matplotlib.figure
+
+        from surface_change_monitor.validate import generate_latency_figure
+
+        results = {
+            "Bergen": {
+                "change_date": "2024-03",
+                "detection_date": "2024-05",
+                "latency_months": 2,
+            }
+        }
+        fig = generate_latency_figure(results)
+        try:
+            assert isinstance(fig, matplotlib.figure.Figure)
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_single_area_figure(self):
+        """Single study area produces a figure with at least one axis."""
+        from surface_change_monitor.validate import generate_latency_figure
+
+        results = {
+            "Bergen": {
+                "change_date": "2024-01",
+                "detection_date": "2024-03",
+                "latency_months": 2,
+            }
+        }
+        fig = generate_latency_figure(results)
+        try:
+            assert len(fig.axes) >= 1
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_multiple_areas(self):
+        """Two study areas produce a valid figure without errors."""
+        from surface_change_monitor.validate import generate_latency_figure
+
+        results = {
+            "Bergen": {
+                "change_date": "2024-03",
+                "detection_date": "2024-05",
+                "latency_months": 2,
+            },
+            "Houston": {
+                "change_date": "2024-06",
+                "detection_date": "2024-08",
+                "latency_months": 2,
+            },
+        }
+        fig = generate_latency_figure(results)
+        try:
+            assert isinstance(fig, matplotlib.figure.Figure)
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_area_with_no_detection(self):
+        """Areas where detection never occurred are handled without errors."""
+        from surface_change_monitor.validate import generate_latency_figure
+
+        results = {
+            "Bergen": {
+                "change_date": "2024-03",
+                "detection_date": None,
+                "latency_months": None,
+            }
+        }
+        fig = generate_latency_figure(results)
+        try:
+            assert isinstance(fig, matplotlib.figure.Figure)
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_saves_to_output_path(self, tmp_path):
+        """Figure is saved to disk when output_path is provided."""
+        from surface_change_monitor.validate import generate_latency_figure
+
+        results = {
+            "Bergen": {
+                "change_date": "2024-03",
+                "detection_date": "2024-06",
+                "latency_months": 3,
+            }
+        }
+        out = tmp_path / "latency.png"
+        fig = generate_latency_figure(results, output_path=out)
+        try:
+            assert out.exists()
+            assert out.stat().st_size > 0
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_empty_results(self):
+        """Empty results dict produces a valid figure."""
+        from surface_change_monitor.validate import generate_latency_figure
+
+        fig = generate_latency_figure({})
+        try:
+            assert isinstance(fig, matplotlib.figure.Figure)
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+
+    def test_y_axis_labels_match_area_names(self):
+        """Y-axis tick labels correspond to the provided area names."""
+        from surface_change_monitor.validate import generate_latency_figure
+
+        results = {
+            "Bergen": {
+                "change_date": "2024-03",
+                "detection_date": "2024-05",
+                "latency_months": 2,
+            },
+            "Houston": {
+                "change_date": "2024-06",
+                "detection_date": None,
+                "latency_months": None,
+            },
+        }
+        fig = generate_latency_figure(results)
+        try:
+            ax = fig.axes[0]
+            tick_labels = [t.get_text() for t in ax.get_yticklabels()]
+            assert "Bergen" in tick_labels
+            assert "Houston" in tick_labels
+        finally:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
