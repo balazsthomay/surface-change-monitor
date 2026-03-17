@@ -475,3 +475,353 @@ class TestOutputFormats:
         assert loaded.crs.to_epsg() == 32632, (
             f"Expected EPSG:32632, got {loaded.crs}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Task 16 tests
+# ---------------------------------------------------------------------------
+
+
+def _make_change_gdf(
+    polygons: list,
+    epsg: int = 32632,
+) -> "gpd.GeoDataFrame":
+    """Build a minimal change GeoDataFrame with required columns."""
+    import geopandas as gpd
+
+    records = [
+        {"geometry": p, "confidence": 0.9, "area_m2": p.area, "detection_period": None}
+        for p in polygons
+    ]
+    gdf = gpd.GeoDataFrame(records, geometry="geometry")
+    return gdf.set_crs(epsg=epsg)
+
+
+def _make_buildings_gdf(
+    polygons: list,
+    epsg: int = 32632,
+) -> "gpd.GeoDataFrame":
+    """Build a minimal buildings GeoDataFrame."""
+    import geopandas as gpd
+
+    records = [{"geometry": p} for p in polygons]
+    gdf = gpd.GeoDataFrame(records, geometry="geometry")
+    return gdf.set_crs(epsg=epsg)
+
+
+# UTM 32N coordinates within Bergen AOI area (metres)
+# Origin at (297000, 6690000); 10 m pixel grid
+
+# A 50x50 m building footprint at (297100, 6690100) – (297150, 6690150)
+_BUILDING_POLY = _make_buildings_gdf([
+    __import__("shapely.geometry", fromlist=["box"]).box(297100, 6690100, 297150, 6690150)
+])
+
+# Change polygon that is fully inside the building footprint
+_CHANGE_INSIDE_BUILDING = _make_change_gdf([
+    __import__("shapely.geometry", fromlist=["box"]).box(297110, 6690110, 297140, 6690140)
+])
+
+# Change polygon with no overlap with any building
+_CHANGE_NO_BUILDING = _make_change_gdf([
+    __import__("shapely.geometry", fromlist=["box"]).box(297300, 6690300, 297350, 6690350)
+])
+
+# Change polygon that partially overlaps a building (40% overlap)
+# Building: 297100-297150 x 6690100-6690150 (50x50=2500 m²)
+# Change polygon: 297120-297200 x 6690100-6690150 (80x50=4000 m²)
+# Intersection: 297120-297150 x 6690100-6690150 (30x50=1500 m²)
+# overlap_fraction = 1500/4000 = 0.375 -> above 0.3 threshold -> new_building
+_BUILDING_PARTIAL = _make_buildings_gdf([
+    __import__("shapely.geometry", fromlist=["box"]).box(297100, 6690100, 297150, 6690150)
+])
+_CHANGE_PARTIAL_HIGH = _make_change_gdf([
+    __import__("shapely.geometry", fromlist=["box"]).box(297120, 6690100, 297200, 6690150)
+])
+# Change polygon: 297150-297300 x 6690100-6690150 (150x50=7500 m²)
+# Intersection: 0 (no overlap since building ends at 297150 and change starts at 297150)
+# Actually set up a 5% overlap case -> new_paving
+# Change polygon: 297145-297300 x 6690100-6690150 (155x50=7750 m²)
+# Intersection: 297145-297150 x 6690100-6690150 (5x50=250 m²)
+# overlap_fraction = 250/7750 = 0.032 -> below 0.3 threshold -> new_paving
+_CHANGE_PARTIAL_LOW = _make_change_gdf([
+    __import__("shapely.geometry", fromlist=["box"]).box(297145, 6690100, 297300, 6690150)
+])
+
+
+# ---------------------------------------------------------------------------
+# 16.1 Failing tests: change type classification
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyBuildingOverlap:
+    """test_classify_building_overlap: Polygon overlapping building -> 'new_building'."""
+
+    def test_full_overlap_classified_as_new_building(self) -> None:
+        """Change polygon fully inside a building footprint -> 'new_building'."""
+        from surface_change_monitor.postprocess import classify_change_type
+
+        result = classify_change_type(_CHANGE_INSIDE_BUILDING, _BUILDING_POLY)
+
+        assert "change_type" in result.columns, "Missing 'change_type' column"
+        assert result["change_type"].iloc[0] == "new_building", (
+            f"Expected 'new_building', got '{result['change_type'].iloc[0]}'"
+        )
+
+    def test_high_partial_overlap_classified_as_new_building(self) -> None:
+        """Change polygon with >= 0.3 overlap fraction -> 'new_building'."""
+        from surface_change_monitor.postprocess import classify_change_type
+
+        result = classify_change_type(_CHANGE_PARTIAL_HIGH, _BUILDING_PARTIAL)
+
+        assert result["change_type"].iloc[0] == "new_building", (
+            f"Expected 'new_building' for 37.5% overlap, got '{result['change_type'].iloc[0]}'"
+        )
+
+    def test_original_gdf_unchanged(self) -> None:
+        """classify_change_type must not mutate the input GeoDataFrame."""
+        import geopandas as gpd
+
+        from surface_change_monitor.postprocess import classify_change_type
+
+        changes_copy = _CHANGE_INSIDE_BUILDING.copy()
+        classify_change_type(_CHANGE_INSIDE_BUILDING, _BUILDING_POLY)
+
+        # Original should not have change_type column added
+        assert "change_type" not in _CHANGE_INSIDE_BUILDING.columns, (
+            "classify_change_type must not mutate the input GeoDataFrame"
+        )
+
+
+class TestClassifyNoOverlap:
+    """test_classify_no_overlap: No building overlap -> 'new_paving'."""
+
+    def test_no_overlap_classified_as_new_paving(self) -> None:
+        """Change polygon far from any building -> 'new_paving'."""
+        from surface_change_monitor.postprocess import classify_change_type
+
+        result = classify_change_type(_CHANGE_NO_BUILDING, _BUILDING_POLY)
+
+        assert "change_type" in result.columns, "Missing 'change_type' column"
+        assert result["change_type"].iloc[0] == "new_paving", (
+            f"Expected 'new_paving', got '{result['change_type'].iloc[0]}'"
+        )
+
+    def test_empty_buildings_all_new_paving(self) -> None:
+        """When buildings GeoDataFrame is empty, all changes are 'new_paving'."""
+        import geopandas as gpd
+
+        from surface_change_monitor.postprocess import classify_change_type
+
+        empty_buildings = gpd.GeoDataFrame(columns=["geometry"], geometry="geometry")
+        empty_buildings = empty_buildings.set_crs(epsg=32632)
+
+        result = classify_change_type(_CHANGE_INSIDE_BUILDING, empty_buildings)
+
+        assert (result["change_type"] == "new_paving").all(), (
+            "All polygons should be 'new_paving' when no buildings available"
+        )
+
+    def test_low_partial_overlap_classified_as_new_paving(self) -> None:
+        """Change polygon with < 0.3 overlap fraction -> 'new_paving'."""
+        from surface_change_monitor.postprocess import classify_change_type
+
+        result = classify_change_type(_CHANGE_PARTIAL_LOW, _BUILDING_PARTIAL)
+
+        assert result["change_type"].iloc[0] == "new_paving", (
+            f"Expected 'new_paving' for ~3.2% overlap, got '{result['change_type'].iloc[0]}'"
+        )
+
+
+class TestPartialOverlap:
+    """test_partial_overlap: Classification based on overlap fraction and threshold."""
+
+    def test_custom_threshold_respected(self) -> None:
+        """Overlap at 37.5% is above 0.3 but below 0.5 -> result changes with threshold."""
+        from surface_change_monitor.postprocess import classify_change_type
+
+        result_low_thresh = classify_change_type(
+            _CHANGE_PARTIAL_HIGH, _BUILDING_PARTIAL, overlap_threshold=0.3
+        )
+        result_high_thresh = classify_change_type(
+            _CHANGE_PARTIAL_HIGH, _BUILDING_PARTIAL, overlap_threshold=0.5
+        )
+
+        assert result_low_thresh["change_type"].iloc[0] == "new_building", (
+            "37.5% overlap should be 'new_building' at 0.3 threshold"
+        )
+        assert result_high_thresh["change_type"].iloc[0] == "new_paving", (
+            "37.5% overlap should be 'new_paving' at 0.5 threshold"
+        )
+
+    def test_exact_threshold_boundary(self) -> None:
+        """Overlap exactly at threshold should be classified as 'new_building' (>=)."""
+        from shapely.geometry import box
+
+        from surface_change_monitor.postprocess import classify_change_type
+
+        # Change polygon: 297100-297200 x 6690100-6690130 (100x30=3000 m²)
+        # Building:       297100-297200 x 6690100-6690109 (100x9=900 m²)
+        # overlap_fraction = 900/3000 = 0.3 -> exactly at threshold -> new_building
+        change = _make_change_gdf([box(297100, 6690100, 297200, 6690130)])
+        building = _make_buildings_gdf([box(297100, 6690100, 297200, 6690109)])
+
+        result = classify_change_type(change, building, overlap_threshold=0.3)
+
+        assert result["change_type"].iloc[0] == "new_building", (
+            "Overlap at exactly 0.3 threshold should be 'new_building'"
+        )
+
+    def test_multiple_polygons_classified_independently(self) -> None:
+        """Multiple change polygons are each classified independently."""
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        from surface_change_monitor.postprocess import classify_change_type
+
+        # Two change polygons: one inside building, one outside
+        changes = _make_change_gdf([
+            box(297110, 6690110, 297140, 6690140),   # inside building
+            box(297300, 6690300, 297350, 6690350),   # no building overlap
+        ])
+        buildings = _make_buildings_gdf([
+            box(297100, 6690100, 297150, 6690150)
+        ])
+
+        result = classify_change_type(changes, buildings)
+
+        assert len(result) == 2
+        assert result["change_type"].iloc[0] == "new_building"
+        assert result["change_type"].iloc[1] == "new_paving"
+
+    def test_returns_geodataframe(self) -> None:
+        """classify_change_type must return a GeoDataFrame."""
+        import geopandas as gpd
+
+        from surface_change_monitor.postprocess import classify_change_type
+
+        result = classify_change_type(_CHANGE_INSIDE_BUILDING, _BUILDING_POLY)
+
+        assert isinstance(result, gpd.GeoDataFrame), (
+            f"Expected GeoDataFrame, got {type(result)}"
+        )
+
+    def test_change_type_column_values(self) -> None:
+        """change_type column must only contain valid values."""
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        from surface_change_monitor.postprocess import classify_change_type
+
+        changes = _make_change_gdf([
+            box(297110, 6690110, 297140, 6690140),
+            box(297300, 6690300, 297350, 6690350),
+        ])
+        buildings = _make_buildings_gdf([box(297100, 6690100, 297150, 6690150)])
+
+        result = classify_change_type(changes, buildings)
+
+        valid_types = {"new_building", "new_paving", "other"}
+        unexpected = set(result["change_type"].unique()) - valid_types
+        assert not unexpected, f"Unexpected change_type values: {unexpected}"
+
+
+class TestLoadBuildingFootprints:
+    """test_load_building_footprints: Load from GeoParquet for AOI."""
+
+    def test_returns_geodataframe(self, tmp_path: Path) -> None:
+        """load_building_footprints returns a GeoDataFrame."""
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        from surface_change_monitor.config import BERGEN_AOI
+        from surface_change_monitor.postprocess import load_building_footprints
+
+        # Build a minimal GeoParquet with some buildings inside and outside AOI
+        # Bergen AOI in WGS84: (5.27, 60.35, 5.40, 60.44) lon/lat
+        buildings = gpd.GeoDataFrame(
+            {"geometry": [box(5.28, 60.36, 5.30, 60.38)]},
+            geometry="geometry",
+        ).set_crs(epsg=4326)
+
+        parquet_path = tmp_path / "buildings.parquet"
+        buildings.to_parquet(str(parquet_path))
+
+        result = load_building_footprints(parquet_path, BERGEN_AOI)
+
+        assert isinstance(result, gpd.GeoDataFrame), (
+            f"Expected GeoDataFrame, got {type(result)}"
+        )
+
+    def test_clips_to_aoi_bbox(self, tmp_path: Path) -> None:
+        """Buildings outside the AOI bounding box are excluded."""
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        from surface_change_monitor.config import BERGEN_AOI
+        from surface_change_monitor.postprocess import load_building_footprints
+
+        west, south, east, north = BERGEN_AOI.bbox  # WGS84 degrees
+        inside = box(west + 0.01, south + 0.01, west + 0.05, south + 0.04)
+        outside = box(west - 1.0, south - 1.0, west - 0.5, south - 0.5)
+
+        buildings = gpd.GeoDataFrame(
+            {"geometry": [inside, outside]},
+            geometry="geometry",
+        ).set_crs(epsg=4326)
+
+        parquet_path = tmp_path / "buildings.parquet"
+        buildings.to_parquet(str(parquet_path))
+
+        result = load_building_footprints(parquet_path, BERGEN_AOI)
+
+        # Only the building inside the AOI should be returned
+        assert len(result) == 1, (
+            f"Expected 1 building inside AOI, got {len(result)}"
+        )
+
+    def test_has_geometry_column(self, tmp_path: Path) -> None:
+        """Returned GeoDataFrame has a geometry column."""
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        from surface_change_monitor.config import BERGEN_AOI
+        from surface_change_monitor.postprocess import load_building_footprints
+
+        west, south, east, north = BERGEN_AOI.bbox
+        buildings = gpd.GeoDataFrame(
+            {"geometry": [box(west + 0.01, south + 0.01, west + 0.05, south + 0.04)]},
+            geometry="geometry",
+        ).set_crs(epsg=4326)
+
+        parquet_path = tmp_path / "buildings.parquet"
+        buildings.to_parquet(str(parquet_path))
+
+        result = load_building_footprints(parquet_path, BERGEN_AOI)
+
+        assert result.geometry is not None, "GeoDataFrame must have geometry column"
+
+    def test_empty_parquet_returns_empty_gdf(self, tmp_path: Path) -> None:
+        """Empty GeoParquet file returns an empty GeoDataFrame."""
+        import geopandas as gpd
+
+        from surface_change_monitor.config import BERGEN_AOI
+        from surface_change_monitor.postprocess import load_building_footprints
+
+        empty_gdf = gpd.GeoDataFrame({"geometry": []}, geometry="geometry").set_crs(epsg=4326)
+
+        parquet_path = tmp_path / "empty_buildings.parquet"
+        empty_gdf.to_parquet(str(parquet_path))
+
+        result = load_building_footprints(parquet_path, BERGEN_AOI)
+
+        assert isinstance(result, gpd.GeoDataFrame)
+        assert len(result) == 0, "Expected empty GeoDataFrame from empty parquet"
+
+    def test_file_not_found_raises(self) -> None:
+        """FileNotFoundError is raised when the parquet file does not exist."""
+        from surface_change_monitor.config import BERGEN_AOI
+        from surface_change_monitor.postprocess import load_building_footprints
+
+        with pytest.raises(FileNotFoundError):
+            load_building_footprints(Path("/nonexistent/path/buildings.parquet"), BERGEN_AOI)

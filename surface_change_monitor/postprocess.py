@@ -26,12 +26,16 @@ Typical usage
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import geopandas as gpd
 import rasterio.features
 import xarray as xr
 from scipy.ndimage import binary_closing, binary_opening
 from shapely.geometry import shape
+
+from surface_change_monitor.config import AOI
 
 
 def vectorize_changes(
@@ -142,3 +146,122 @@ def vectorize_changes(
         gdf = gdf.set_crs(crs)
 
     return gdf
+
+
+def load_building_footprints(footprints_path: Path, aoi: AOI) -> gpd.GeoDataFrame:
+    """Load Microsoft Building Footprints from a local GeoParquet file, clipped to an AOI.
+
+    Parameters
+    ----------
+    footprints_path:
+        Path to a GeoParquet file containing building polygon geometries.
+        The file must have a geometry column and a CRS.
+    aoi:
+        Area of interest used to spatially filter the footprints.
+        The ``bbox`` is expected as ``(west, south, east, north)`` in WGS84 degrees.
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Building polygons clipped to the AOI bounding box, in the file's original CRS.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *footprints_path* does not exist.
+    """
+    if not footprints_path.exists():
+        raise FileNotFoundError(f"Building footprints file not found: {footprints_path}")
+
+    gdf = gpd.read_parquet(str(footprints_path))
+
+    if gdf.empty:
+        return gdf
+
+    west, south, east, north = aoi.bbox
+    clipped = gdf.cx[west:east, south:north]
+
+    return clipped.reset_index(drop=True)
+
+
+def classify_change_type(
+    changes: gpd.GeoDataFrame,
+    buildings: gpd.GeoDataFrame,
+    overlap_threshold: float = 0.3,
+) -> gpd.GeoDataFrame:
+    """Classify each change polygon as 'new_building', 'new_paving', or 'other'.
+
+    For each change polygon the function computes the fraction of the polygon's
+    area that overlaps with any building footprint:
+
+        overlap_fraction = total_intersection_area / change_polygon_area
+
+    If ``overlap_fraction >= overlap_threshold`` the change is labelled
+    ``"new_building"``; otherwise ``"new_paving"``.  The ``"other"`` label is
+    reserved for edge cases (e.g. zero-area polygons) but is not expected in
+    normal operation.
+
+    Parameters
+    ----------
+    changes:
+        GeoDataFrame of change polygons (output of :func:`vectorize_changes`).
+        Must carry a valid CRS.
+    buildings:
+        GeoDataFrame of building footprint polygons (e.g. from
+        :func:`load_building_footprints`).  Must be in the same CRS as
+        *changes*, or empty.
+    overlap_threshold:
+        Minimum overlap fraction to classify a polygon as ``"new_building"``.
+        Default 0.3 (30 %).
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        A copy of *changes* with an added ``change_type`` string column.
+        The input GeoDataFrame is never mutated.
+    """
+    result = changes.copy()
+
+    if result.empty:
+        result["change_type"] = []
+        return result
+
+    change_types: list[str] = []
+
+    if buildings.empty:
+        result["change_type"] = "new_paving"
+        return result
+
+    # Ensure buildings are in the same CRS as changes
+    if buildings.crs is not None and result.crs is not None and buildings.crs != result.crs:
+        buildings = buildings.to_crs(result.crs)
+
+    # Build a union of all building geometries for efficient intersection queries
+    # using a spatial index (sindex) on the buildings GeoDataFrame
+    buildings_sindex = buildings.sindex
+
+    for change_geom in result.geometry:
+        if change_geom is None or change_geom.is_empty or change_geom.area == 0:
+            change_types.append("other")
+            continue
+
+        # Query the spatial index for candidate buildings
+        candidate_idx = list(buildings_sindex.query(change_geom, predicate="intersects"))
+
+        if not candidate_idx:
+            change_types.append("new_paving")
+            continue
+
+        candidate_buildings = buildings.iloc[candidate_idx]
+        total_intersection_area = float(
+            candidate_buildings.geometry.intersection(change_geom).area.sum()
+        )
+        overlap_fraction = total_intersection_area / change_geom.area
+
+        if overlap_fraction >= overlap_threshold:
+            change_types.append("new_building")
+        else:
+            change_types.append("new_paving")
+
+    result["change_type"] = change_types
+    return result
