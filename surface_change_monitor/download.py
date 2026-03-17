@@ -21,8 +21,17 @@ import xarray as xr
 from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 
-from surface_change_monitor.config import AOI, BANDS_20M
+from surface_change_monitor.config import AOI, BANDS_10M, BANDS_20M, CDSE_ODATA_URL
 from surface_change_monitor.stac import SceneMetadata
+
+# Map logical band names to STAC asset keys at their native resolution.
+BAND_ASSET_KEY: dict[str, str] = {}
+for _b in BANDS_10M:
+    BAND_ASSET_KEY[_b] = f"{_b}_10m"
+for _b in BANDS_20M:
+    BAND_ASSET_KEY[_b] = f"{_b}_20m"
+
+_ZIPPER_BASE = "https://zipper.dataspace.copernicus.eu/odata/v1"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,6 +59,84 @@ _RESAMPLING_MAP: dict[str, Resampling] = {
 
 class DownloadError(RuntimeError):
     """Raised when a band download fails after exhausting all retries."""
+
+
+# ---------------------------------------------------------------------------
+# S3 href -> OData Nodes URL conversion
+# ---------------------------------------------------------------------------
+
+
+def _lookup_product_uuid(product_name: str, token: str) -> str:
+    """Look up the OData product UUID from the product .SAFE name."""
+    resp = requests.get(
+        f"{CDSE_ODATA_URL}Products",
+        params={"$filter": f"Name eq '{product_name}'"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("value", [])
+    if not results:
+        raise DownloadError(f"Product {product_name!r} not found in OData catalogue")
+    return results[0]["Id"]
+
+
+def _s3_href_to_nodes_url(s3_href: str, product_uuid: str) -> str:
+    """Convert an S3 href to an OData Nodes download URL.
+
+    Example S3 href:
+        s3://eodata/Sentinel-2/MSI/.../PRODUCT.SAFE/GRANULE/.../IMG_DATA/R10m/FILE.jp2
+
+    The Nodes URL traverses the product's internal directory tree starting
+    from the .SAFE root.
+    """
+    # Find the .SAFE directory and everything after it
+    safe_idx = s3_href.find(".SAFE/")
+    if safe_idx == -1:
+        raise DownloadError(f"Cannot parse .SAFE path from S3 href: {s3_href}")
+
+    # Extract product name (the .SAFE directory)
+    s3_path = s3_href.replace("s3://eodata/", "")
+    parts = s3_path.split("/")
+    safe_name = None
+    internal_parts: list[str] = []
+    found_safe = False
+    for part in parts:
+        if part.endswith(".SAFE"):
+            safe_name = part
+            found_safe = True
+            continue
+        if found_safe:
+            internal_parts.append(part)
+
+    if not safe_name or not internal_parts:
+        raise DownloadError(f"Cannot parse S3 href: {s3_href}")
+
+    # Build Nodes() chain: Products(UUID)/Nodes(SAFE)/Nodes(dir1)/.../$value
+    url = f"{_ZIPPER_BASE}/Products({product_uuid})/Nodes({safe_name})"
+    for part in internal_parts:
+        url += f"/Nodes({part})"
+    url += "/$value"
+    return url
+
+
+def _resolve_s3_href(s3_href: str, token: str, scene: SceneMetadata) -> str:
+    """Convert S3 href to a downloadable HTTP URL via OData Nodes API.
+
+    Caches the product UUID lookup on the scene object.
+    """
+    if not s3_href.startswith("s3://"):
+        return s3_href  # Already an HTTP URL
+
+    # Cache UUID on the scene to avoid repeated lookups for the same product
+    if not hasattr(scene, "_product_uuid"):
+        product_name = scene.product_id
+        if not product_name.endswith(".SAFE"):
+            product_name += ".SAFE"
+        uuid = _lookup_product_uuid(product_name, token)
+        object.__setattr__(scene, "_product_uuid", uuid)
+
+    return _s3_href_to_nodes_url(s3_href, scene._product_uuid)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +314,12 @@ def download_scene_bands(
     scene_dir = raw_dir / scene.scene_id
 
     for band in bands:
-        href = scene.assets.get(band)
+        # Look up the STAC asset key for this band (e.g. "B02" -> "B02_10m").
+        asset_key = BAND_ASSET_KEY.get(band, band)
+        href = scene.assets.get(asset_key)
+        if href is None:
+            # Fallback: try the plain band name (for mocked/non-CDSE catalogs).
+            href = scene.assets.get(band)
         if href is None:
             continue
 
@@ -240,7 +332,8 @@ def download_scene_bands(
         # Final processed path.
         processed_path = scene_dir / f"{band}.tif"
 
-        # Step 1: download.
+        # Step 1: resolve S3 href to HTTP URL and download.
+        href = _resolve_s3_href(href, token, scene)
         download_band(href, raw_path, token, max_retries=max_retries)
 
         # Step 2: clip, reproject, resample to 10 m.
