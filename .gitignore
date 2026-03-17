@@ -10,6 +10,11 @@ wheels/
 .coverage
 .pytest_cache/
 
+# Data and model artifacts
+data/
+models/
+output/
+
 # Virtual environments
 .venv
 .env
