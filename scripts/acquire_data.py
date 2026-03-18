@@ -11,6 +11,7 @@ from pathlib import Path
 from surface_change_monitor.auth import TokenManager
 from surface_change_monitor.composite import create_monthly_composite, group_scenes_by_month
 from surface_change_monitor.config import (
+    AOI,
     BANDS_10M,
     BANDS_20M,
     BERGEN_AOI,
@@ -24,10 +25,24 @@ from surface_change_monitor.stac import search_scenes
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-AOIS = {"bergen": BERGEN_AOI, "houston": HOUSTON_AOI}
+AOIS = {
+    "bergen": BERGEN_AOI,
+    "houston": HOUSTON_AOI,
+    "oslo": AOI("oslo", (10.65, 59.85, 10.85, 59.95), 32632),
+    "amsterdam": AOI("amsterdam", (4.75, 52.30, 4.95, 52.42), 32631),
+    "warsaw": AOI("warsaw", (20.85, 52.15, 21.10, 52.30), 32634),
+    "dublin": AOI("dublin", (-6.40, 53.28, -6.15, 53.40), 32629),
+}
 
 # Primary Sentinel-2 tiles for each AOI (reduces redundant downloads)
-PRIMARY_TILES = {"bergen": "T32VLN", "houston": None}
+PRIMARY_TILES = {
+    "bergen": "T32VLN",
+    "oslo": "T32VPM",
+    "amsterdam": "T31UFU",
+    "warsaw": "T34UED",
+    "dublin": "T29UPV",
+    "houston": None,
+}
 MAX_SCENES_PER_MONTH = 5
 
 

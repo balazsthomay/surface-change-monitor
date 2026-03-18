@@ -145,7 +145,7 @@ class BiTemporalChangeDataset(NonGeoDataset):
 
     def _collect_patches(self) -> list[Path]:
         """Return sorted list of .npz paths matching the requested split."""
-        all_paths = sorted(self.patches_dir.glob("*.npz"))
+        all_paths = sorted(self.patches_dir.rglob("*.npz"))
 
         if self.split is None:
             return all_paths
