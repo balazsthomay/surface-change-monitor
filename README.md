@@ -38,7 +38,7 @@ Trained on 5 European cities (Bergen, Oslo, Amsterdam, Warsaw as train; Dublin a
 | HRL change rate | 6.0% of pixels |
 | Detected polygons | 115 |
 
-![Threshold sweep](output/validation/bergen_threshold_sweep.png)
+![Threshold sweep](docs/figures/bergen_threshold_sweep.png)
 
 ### Houston (2018 -> 2021)
 
