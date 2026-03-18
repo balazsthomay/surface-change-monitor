@@ -41,7 +41,7 @@ PRIMARY_TILES = {
     "amsterdam": "T31UFU",
     "warsaw": "T34UED",
     "dublin": "T29UPV",
-    "houston": None,
+    "houston": "T15RTN",
 }
 MAX_SCENES_PER_MONTH = 5
 
